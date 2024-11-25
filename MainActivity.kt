@@ -1,4 +1,5 @@
 package com.example.myapplication
+
 import com.example.myapplication.MeasurementResultScreen
 import com.example.myapplication.BluetoothCommunication
 import com.example.myapplication.PlotData
@@ -55,7 +56,6 @@ import com.google.gson.Gson
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-
 
 @OptIn(ExperimentalMaterial3Api::class)
 class MainActivity : ComponentActivity() {
