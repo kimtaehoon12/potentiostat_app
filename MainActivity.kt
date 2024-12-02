@@ -232,20 +232,28 @@ class BluetoothForegroundService : Service() {
 
                 BluetoothCommunication.sendData(socket, command)
                 BluetoothCommunication.receiveData(socket) { receivedData ->
-                    if (receivedData.trim() == "done") {
-                        SharedMeasurementState.isMeasuring = false
-                        val scanRate = if (measurementType == "CA") 5 else {
-                            sharedPreferences.getString("scanRate", "50")?.toInt() ?: 50
-                        }
-                        processAndSaveData(measurementType, scanRate)
-                        Log.d("BluetoothService", "Measurement complete.")
-                    } else {
-                        synchronized(dataQueue) {
+                    synchronized(dataQueue) {
+                        if (receivedData.trim() == "done") {
+                            // 'done' 메시지를 데이터 큐나 처리 로직에 포함하지 않음
+                            while (dataQueue.isNotEmpty()) {
+                                val queuedData = dataQueue.removeFirst()
+                                processIncomingData(queuedData)
+                            }
+
+                            SharedMeasurementState.isMeasuring = false
+                            val scanRate = if (measurementType == "CA") 5 else {
+                                sharedPreferences.getString("scanRate", "50")?.toInt() ?: 50
+                            }
+                            processAndSaveData(measurementType, scanRate)
+                            Log.d("BluetoothService", "Measurement complete.")
+                        } else {
+                            // 'done'이 아닌 경우에만 데이터 큐에 추가 및 처리
                             dataQueue.add(receivedData.trim())
+                            processIncomingData(receivedData)
                         }
-                        processIncomingData(receivedData)
                     }
                 }
+
 
             } ?: throw IOException("Socket is null after reconnect attempt.")
         } catch (e: Exception) {
