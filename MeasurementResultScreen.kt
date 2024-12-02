@@ -1,144 +1,62 @@
 package com.example.myapplication
 
-import android.content.Context
-import android.widget.Toast
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
-import androidx.compose.material3.Icon
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.unit.dp
-import androidx.navigation.NavController
-import java.io.File
-import com.google.gson.Gson
-import androidx.compose.runtime.Composable
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import java.io.IOException
+import android.bluetooth.BluetoothSocket
 import android.util.Log
-import com.google.gson.reflect.TypeToken
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun MeasurementResultScreen(context: Context, navController: NavController) {
-    var fileList by remember { mutableStateOf(listOf<File>()) }
-    var selectedFile by remember { mutableStateOf<File?>(null) }
-    var graphData by remember { mutableStateOf<List<Pair<Double, Double>>>(emptyList()) }
-    var isFiltered by remember { mutableStateOf(false) }
+object BluetoothCommunication {
 
-    LaunchedEffect(Unit) {
-        // 저장된 파일 리스트 불러오기
-        fileList = context.filesDir.listFiles { file -> file.name.endsWith(".json") }?.toList() ?: emptyList()
+    fun sendData(socket: BluetoothSocket, data: String) {
+        try {
+            socket.outputStream.write(data.toByteArray())
+        } catch (e: IOException) {
+            Log.e("BluetoothCommunication", "Error writing data: ${e.message}")
+        }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Measurement Results") },
-                navigationIcon = {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
-                    }
-                }
-            )
-        }
-    ) { innerPadding ->
-        Column(modifier = Modifier.padding(innerPadding).padding(16.dp)) {
-            if (selectedFile == null) {
-                // 파일 리스트 표시
-                LazyColumn {
-                    items(fileList) { file ->
-                        Text(
-                            text = file.name,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    selectedFile = file
-                                    loadFileData(file, context, isFiltered) { data ->
-                                        graphData = data
-                                    }
-                                }
-                                .padding(8.dp),
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    }
-                }
-            } else {
-                // 선택된 파일의 플롯 표시
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = "Selected File: ${selectedFile?.name ?: "None"}",
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    Button(onClick = { selectedFile = null }) {
-                        Text("Back to File List")
-                    }
-                }
+    fun receiveData(socket: BluetoothSocket, onDataReceived: (String) -> Unit) {
+        val queue = LinkedBlockingQueue<String>() // 무한 큐
+        val tempBuffer = ByteArray(2048)
+        var leftover = ""
 
-                Spacer(modifier = Modifier.height(16.dp))
+        val receiveThread = Thread {
+            try {
+                while (socket.isConnected) {
+                    val bytesRead = socket.inputStream.read(tempBuffer)
+                    if (bytesRead > 0) {
+                        val receivedData = leftover + String(tempBuffer, 0, bytesRead)
+                        val lines = receivedData.split("\n")
+                        leftover = if (receivedData.endsWith("\n")) "" else lines.last()
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(text = if (isFiltered) "Filtered Data" else "Raw Data")
-                    Switch(checked = isFiltered, onCheckedChange = {
-                        isFiltered = it
-                        selectedFile?.let { file ->
-                            loadFileData(file, context, isFiltered) { data ->
-                                graphData = data
-                            }
+                        // 큐에 데이터 추가
+                        synchronized(queue) {
+                            lines.dropLast(1).forEach { queue.offer(it.trim()) }
                         }
-                    })
+                    }
                 }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                if (graphData.isNotEmpty()) {
-                    PlotData(
-                        data = graphData,
-                        type = if (isFiltered) "Filtered" else "Raw",
-                        label = if (isFiltered) "Filtered Data" else "Raw Data" // label 추가
-                    )
-                } else {
-                    Text("No data to display", style = MaterialTheme.typography.bodyMedium)
-                }
+            } catch (e: IOException) {
+                Log.e("BluetoothCommunication", "Error reading data: ${e.message}")
             }
         }
-    }
-}
 
-private fun loadFileData(
-    file: File,
-    context: Context,
-    isFiltered: Boolean,
-    onDataLoaded: (List<Pair<Double, Double>>) -> Unit
-) {
-    try {
-        val jsonData = file.readText()
-        val dataList = Gson().fromJson<List<Map<String, Any>>>(jsonData, object : TypeToken<List<Map<String, Any>>>() {}.type)
-
-        val graphData = dataList.mapNotNull {
-            val x = it["pwmCal"] as? Double ?: it["time"] as? Double
-            val y = if (isFiltered) it["valCalFiltered"] as? Double else it["valCalRaw"] as? Double
-            if (x != null && y != null) x to y else null
+        val processThread = Thread {
+            try {
+                while (true) {
+                    val data = quaeue.poll(50, TimeUnit.MILLISECONDS) // 대기 시간을 줄임
+                    data?.let { onDataReceived(it) }
+                }
+            } catch (e: Exception) {
+                Log.e("BluetoothCommunication", "Error processing data: ${e.message}")
+            }
         }
 
-        onDataLoaded(graphData)
-    } catch (e: Exception) {
-        Log.e("MeasurementResultScreen", "Error loading data: ${e.message}")
-        onDataLoaded(emptyList())
+        receiveThread.start()
+        processThread.start()
     }
+
+
+
+
 }
