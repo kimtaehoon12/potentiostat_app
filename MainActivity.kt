@@ -1,5 +1,4 @@
 package com.example.myapplication
-
 import com.example.myapplication.MeasurementResultScreen
 import com.example.myapplication.BluetoothCommunication
 import com.example.myapplication.PlotData
@@ -56,6 +55,12 @@ import com.google.gson.Gson
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.delay
+
+
+object SharedMeasurementState {
+    var isMeasuring by mutableStateOf(false)
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 class MainActivity : ComponentActivity() {
@@ -137,15 +142,18 @@ class BluetoothForegroundService : Service() {
             bluetoothSocket = socket
             isConnected = socket != null && socket.isConnected
         }
+
+        val dataQueue: MutableList<String> = mutableListOf()
     }
 
-    private var isMeasuring = false
     private val rawData = mutableListOf<Pair<Double, Double>>()
     private val filteredData = mutableListOf<Pair<Double, Double>>()
 
+    private var duringMeasurement = false
+
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel() // 알림 채널 생성
+        createNotificationChannel()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -157,7 +165,7 @@ class BluetoothForegroundService : Service() {
                 val measurementType = intent.getStringExtra("measurement_type")
                 if (deviceAddress != null && measurementType != null) {
                     val notification = createNotification("Preparing Measurement...")
-                    startForeground(NOTIFICATION_ID, notification) // Foreground 전환
+                    startForeground(NOTIFICATION_ID, notification)
                     startMeasurement(deviceAddress, measurementType)
                 } else {
                     Log.e("BluetoothService", "Invalid intent data")
@@ -172,89 +180,136 @@ class BluetoothForegroundService : Service() {
 
     @SuppressLint("MissingPermission")
     private fun startMeasurement(deviceAddress: String, measurementType: String) {
-        if (isMeasuring) return
-        isMeasuring = true
-
-        if (isConnected) {
-            Log.d("BluetoothService", "Using existing Bluetooth connection")
-            executeMeasurement(measurementType)
-        } else {
-            val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
-            val device = bluetoothAdapter.getRemoteDevice(deviceAddress)
-            Thread {
-                try {
-                    val socket = device.createRfcommSocketToServiceRecord(UUID.fromString("00001101-0000-1000-8000-00805F9B34FB"))
-                    socket.connect()
-                    updateConnectionState(socket)
-                    executeMeasurement(measurementType)
-                } catch (e: IOException) {
-                    Log.e("BluetoothService", "Failed to connect: ${e.message}")
-                    stopMeasurement()
-                }
-            }.start()
+        if (duringMeasurement) {
+            Log.w("BluetoothService", "Measurement already in progress.")
+            return
         }
-    }
+        duringMeasurement = true
 
-    private fun executeMeasurement(measurementType: String) {
-        val sharedPreferences = getSharedPreferences("MeasurementSettings", Context.MODE_PRIVATE)
-
-        val command = when (measurementType) {
-            "CV" -> {
-                val minVoltage = sharedPreferences.getString("cvMinVoltage", "-0.5") ?: "-0.5"
-                val maxVoltage = sharedPreferences.getString("cvMaxVoltage", "0.5") ?: "0.5"
-                val scanRate = sharedPreferences.getString("scanRate", "50") ?: "50"
-                "CV,$minVoltage,$maxVoltage,$scanRate\n"
-            }
-            "CA" -> {
-                val caVoltage = sharedPreferences.getString("caVoltage", "0.0") ?: "0.0"
-                val caTimeValue = sharedPreferences.getString("caTimeValue", "10") ?: "10"
-                val caTimeUnit = sharedPreferences.getString("caTimeUnit", "sec") ?: "sec"
-                "CA,$caVoltage,$caTimeValue,$caTimeUnit\n"
-            }
-            else -> ""
+        synchronized(dataQueue) {
+            dataQueue.clear() // 기존 데이터 초기화
         }
 
         try {
-            bluetoothSocket?.let { socket ->
-                BluetoothCommunication.sendData(socket, command)
-                Log.d("BluetoothService", "Sent command: $command")
-
-                BluetoothCommunication.receiveData(socket) { receivedData ->
-                    if (receivedData.trim() == "done") {
-                        Log.d("Measurement", "Measurement complete")
-                        val scanRate = sharedPreferences.getString("scanRate", "50")?.toInt() ?: 50
-                        processAndSaveData(measurementType, scanRate)
-                        stopMeasurement()
-                    } else {
-                        processIncomingData(receivedData, measurementType)
-                    }
+            if (bluetoothSocket?.isConnected == true) {
+                Log.d("BluetoothService", "Using existing Bluetooth connection")
+                executeMeasurement(measurementType)
+            } else {
+                Log.d("BluetoothService", "Reconnecting Bluetooth socket")
+                val newSocket = reconnectSocket(deviceAddress)
+                if (newSocket != null) {
+                    executeMeasurement(measurementType)
+                } else {
+                    Log.e("BluetoothService", "Failed to reconnect socket.")
+                    duringMeasurement = false
                 }
-            } ?: Log.e("BluetoothService", "Socket is null")
+            }
         } catch (e: Exception) {
-            Log.e("BluetoothService", "Error during executeMeasurement: ${e.message}")
+            Log.e("BluetoothService", "Error during startMeasurement: ${e.message}")
+            duringMeasurement = false
         }
     }
 
-    private fun processIncomingData(data: String, measurementType: String) {
+
+    @SuppressLint("MissingPermission")
+    private fun executeMeasurement(measurementType: String) {
+        val sharedPreferences = getSharedPreferences("MeasurementSettings", Context.MODE_PRIVATE)
+        try {
+            if (bluetoothSocket == null || !bluetoothSocket!!.isConnected) {
+                Log.d("BluetoothService", "Socket disconnected, attempting reconnect.")
+                val deviceAddress = bluetoothSocket?.remoteDevice?.address
+                if (deviceAddress != null) {
+                    bluetoothSocket = reconnectSocket(deviceAddress)
+                }
+            }
+
+            bluetoothSocket?.let { socket ->
+                val command = when (measurementType) {
+                    "CV" -> createCVCommand()
+                    "CA" -> createCACommand()
+                    else -> throw IllegalArgumentException("Invalid measurement type")
+                }
+
+                BluetoothCommunication.sendData(socket, command)
+                BluetoothCommunication.receiveData(socket) { receivedData ->
+                    if (receivedData.trim() == "done") {
+                        SharedMeasurementState.isMeasuring = false
+                        val scanRate = if (measurementType == "CA") 5 else {
+                            sharedPreferences.getString("scanRate", "50")?.toInt() ?: 50
+                        }
+                        processAndSaveData(measurementType, scanRate)
+                        Log.d("BluetoothService", "Measurement complete.")
+                    } else {
+                        synchronized(dataQueue) {
+                            dataQueue.add(receivedData.trim())
+                        }
+                        processIncomingData(receivedData)
+                    }
+                }
+
+            } ?: throw IOException("Socket is null after reconnect attempt.")
+        } catch (e: Exception) {
+            Log.e("BluetoothService", "Error during executeMeasurement: ${e.message}")
+        } finally {
+            duringMeasurement = false
+        }
+    }
+    private fun createCVCommand(): String {
+        val sharedPreferences = getSharedPreferences("MeasurementSettings", Context.MODE_PRIVATE)
+        val minVoltage = sharedPreferences.getString("cvMinVoltage", "-0.5") ?: "-0.5"
+        val maxVoltage = sharedPreferences.getString("cvMaxVoltage", "0.5") ?: "0.5"
+        val scanRate = sharedPreferences.getString("scanRate", "50") ?: "50"
+        val cycle = sharedPreferences.getString("cvCycle", "5") ?: "5"
+        return "CV,$minVoltage,$maxVoltage,$scanRate,$cycle\n"
+    }
+
+    private fun createCACommand(): String {
+        val sharedPreferences = getSharedPreferences("MeasurementSettings", Context.MODE_PRIVATE)
+        val caVoltage = sharedPreferences.getString("caVoltage", "0.0") ?: "0.0"
+        val caTimeValue = sharedPreferences.getString("caTimeValue", "10") ?: "10"
+        val caTimeUnit = sharedPreferences.getString("caTimeUnit", "sec") ?: "sec"
+        return "CA,$caVoltage,$caTimeValue,$caTimeUnit\n"
+    }
+
+
+    @SuppressLint("MissingPermission")
+    private fun reconnectSocket(deviceAddress: String): BluetoothSocket? {
+        return try {
+            // 이전 소켓 닫기
+            bluetoothSocket?.close()
+            val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
+            val device = bluetoothAdapter.getRemoteDevice(deviceAddress)
+            val newSocket = device.createRfcommSocketToServiceRecord(UUID.fromString("00001101-0000-1000-8000-00805F9B34FB"))
+            newSocket.connect()
+            BluetoothForegroundService.updateConnectionState(newSocket)
+            newSocket
+        } catch (e: IOException) {
+            Log.e("BluetoothService", "Failed to reconnect socket: ${e.message}")
+            null
+        }
+    }
+
+
+
+
+    private fun processIncomingData(data: String) {
         val values = data.split(",")
         if (values.size == 2) {
             val x = values[0].toDoubleOrNull()
             val y = values[1].toDoubleOrNull()
             if (x != null && y != null) {
-                rawData.add(x to y)
+                synchronized(rawData) {
+                    rawData.add(x to y)
+                }
             }
         }
     }
 
     private fun processAndSaveData(measurementType: String, scanRate: Int) {
-        // CA 명령일 경우 scanRate를 10으로 설정
-        val effectiveScanRate = if (measurementType == "CA") 10 else scanRate
-
         val filteredValues = rawData.map { it.second }.let {
-            DataProcessing.zeroPhaseFilter(it, effectiveScanRate)
+            DataProcessing.zeroPhaseFilter(it, scanRate)
         }
 
-        // filteredData 업데이트
         filteredData.clear()
         rawData.forEachIndexed { index, pair ->
             if (index < filteredValues.size) {
@@ -262,13 +317,11 @@ class BluetoothForegroundService : Service() {
             }
         }
 
-        // 데이터를 하나의 파일에 저장
         saveCombinedDataToFile(measurementType)
     }
 
-
     private fun saveCombinedDataToFile(measurementType: String) {
-        val fileIndex = getNextFileIndex(measurementType) // 파일 번호 생성 로직
+        val fileIndex = getNextFileIndex(measurementType)
         val fileName = generateFileName(measurementType, fileIndex)
 
         val combinedData = rawData.mapIndexed { index, pair ->
@@ -276,24 +329,14 @@ class BluetoothForegroundService : Service() {
             val filteredValue = if (index < filteredData.size) filteredData[index].second else null
 
             when (measurementType) {
-                "CV" -> mapOf(
-                    "pwmCal" to pair.first,
-                    "valCalRaw" to rawValue,
-                    "valCalFiltered" to filteredValue
-                )
-                "CA" -> mapOf(
-                    "time" to pair.first,
-                    "valCalRaw" to rawValue,
-                    "valCalFiltered" to filteredValue
-                )
+                "CV" -> mapOf("pwmCal" to pair.first, "valCalRaw" to rawValue, "valCalFiltered" to filteredValue)
+                "CA" -> mapOf("time" to pair.first, "valCalRaw" to rawValue, "valCalFiltered" to filteredValue)
                 else -> null
             }
-        }.filterNotNull() // null 데이터 제거
+        }.filterNotNull()
 
         val file = File(applicationContext.filesDir, fileName)
         file.writeText(Gson().toJson(combinedData))
-
-        Log.d("BluetoothService", "Data saved to $fileName")
     }
 
     private fun generateFileName(measurementType: String, fileIndex: Int): String {
@@ -306,31 +349,35 @@ class BluetoothForegroundService : Service() {
         val files = applicationContext.filesDir.listFiles { file ->
             file.name.startsWith(measurementType) && file.name.endsWith(".json")
         } ?: emptyArray()
-        return files.size + 1 // 기존 파일 수에 +1
+        return files.size + 1
     }
 
     private fun stopMeasurement() {
-        if (!isMeasuring) return
-        isMeasuring = false
+        if (!duringMeasurement) return
+        duringMeasurement = false
 
         try {
+            // 블루투스 소켓 닫기
             bluetoothSocket?.let { socket ->
                 if (socket.isConnected) {
                     socket.close()
                 }
             }
-            updateConnectionState(null)
+            BluetoothForegroundService.updateConnectionState(null) // 연결 상태 초기화
         } catch (e: IOException) {
             Log.e("BluetoothService", "Error while closing socket: ${e.message}")
         } finally {
             try {
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                // Foreground Notification 중지
+                val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                notificationManager.cancel(NOTIFICATION_ID)
             } catch (e: Exception) {
                 Log.e("BluetoothService", "Error stopping foreground: ${e.message}")
             }
-            stopSelf()
+            stopSelf() // 서비스 자체를 종료
         }
     }
+
 
     private fun createNotification(message: String): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -358,8 +405,6 @@ class BluetoothForegroundService : Service() {
         }
     }
 }
-
-
 
 
 // Start Measurement Service
@@ -410,7 +455,6 @@ fun HomeScreen(navController: NavController) {
 @Composable
 fun MeasurementScreen(navController: NavController) {
     val context = LocalContext.current
-    var isMeasuring by remember { mutableStateOf(false) }
     var connectionStatus by remember {
         mutableStateOf(
             if (BluetoothForegroundService.isConnected)
@@ -418,6 +462,20 @@ fun MeasurementScreen(navController: NavController) {
             else
                 "No device connected!"
         )
+    }
+
+    val receivedDataList = remember { mutableStateListOf<String>() }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            synchronized(BluetoothForegroundService.dataQueue) {
+                if (BluetoothForegroundService.dataQueue.isNotEmpty()) {
+                    val data = BluetoothForegroundService.dataQueue.removeAt(0) // 첫 번째 항목 제거
+                    receivedDataList.add(data)
+                }
+            }
+            delay(10) // 폴링 주기를 10ms로 설정 (필요에 따라 조정 가능)
+        }
     }
 
     Scaffold(
@@ -440,63 +498,59 @@ fun MeasurementScreen(navController: NavController) {
             verticalArrangement = Arrangement.spacedBy(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Connection 상태 표시
             Text(
                 text = connectionStatus,
                 color = if (BluetoothForegroundService.isConnected) Color.Green else Color.Red,
                 modifier = Modifier.padding(8.dp)
             )
 
-            // CV Measurement 버튼
             Button(
                 onClick = {
-                    if (!isMeasuring && BluetoothForegroundService.isConnected) {
+                    if (!SharedMeasurementState.isMeasuring && BluetoothForegroundService.isConnected) {
                         connectionStatus = "Starting CV Measurement..."
                         startMeasurementService(
                             context,
                             "CV",
                             BluetoothForegroundService.bluetoothSocket?.remoteDevice?.address ?: "Unknown"
                         )
-                        isMeasuring = true
+                        SharedMeasurementState.isMeasuring = true
                     } else {
                         connectionStatus = "No device connected!"
                     }
                 },
-                enabled = !isMeasuring && BluetoothForegroundService.isConnected,
+                enabled = !SharedMeasurementState.isMeasuring && BluetoothForegroundService.isConnected,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text(if (isMeasuring) "Measuring..." else "CV Measure")
+                Text(if (SharedMeasurementState.isMeasuring) "Measuring..." else "CV Measure")
             }
 
-            // CA Measurement 버튼
             Button(
                 onClick = {
-                    if (!isMeasuring && BluetoothForegroundService.isConnected) {
+                    if (!SharedMeasurementState.isMeasuring && BluetoothForegroundService.isConnected) {
                         connectionStatus = "Starting CA Measurement..."
                         startMeasurementService(
                             context,
                             "CA",
                             BluetoothForegroundService.bluetoothSocket?.remoteDevice?.address ?: "Unknown"
                         )
-                        isMeasuring = true
+                        SharedMeasurementState.isMeasuring = true
                     } else {
                         connectionStatus = "No device connected!"
                     }
                 },
-                enabled = !isMeasuring && BluetoothForegroundService.isConnected,
+                enabled = !SharedMeasurementState.isMeasuring && BluetoothForegroundService.isConnected,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text(if (isMeasuring) "Measuring..." else "CA Measure")
+                Text(if (SharedMeasurementState.isMeasuring) "Measuring..." else "CA Measure")
             }
 
-            // Stop Measurement 버튼
             Button(
                 onClick = {
                     connectionStatus = "Stopping Measurement..."
                     stopMeasurementService(context)
-                    isMeasuring = false
+                    SharedMeasurementState.isMeasuring = false
                 },
-                enabled = isMeasuring,
+                enabled = SharedMeasurementState.isMeasuring,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text("Stop Measurement")
@@ -515,9 +569,21 @@ fun MeasurementScreen(navController: NavController) {
             ) {
                 Text("Measurement Result")
             }
+
+
+            Text("Received Data", style = MaterialTheme.typography.titleLarge)
+            LazyColumn(
+                modifier = Modifier.fillMaxHeight(0.5f),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(receivedDataList) { data ->
+                    Text(text = data)
+                }
+            }
         }
     }
 }
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -531,6 +597,7 @@ fun MeasurementSettingScreen(navController: NavController) {
     var cvMinVoltage by remember { mutableStateOf(sharedPreferences.getString("cvMinVoltage", "-0.5") ?: "-0.5") }
     var cvMaxVoltage by remember { mutableStateOf(sharedPreferences.getString("cvMaxVoltage", "0.5") ?: "0.5") }
     var scanRate by remember { mutableStateOf(sharedPreferences.getString("scanRate", "50") ?: "50") }
+    var cvCycle by remember { mutableStateOf(sharedPreferences.getString("cvCycle", "1") ?: "1") } // Cycle 추가
 
     // CA settings state
     var caVoltage by remember { mutableStateOf(sharedPreferences.getString("caVoltage", "0.0") ?: "0.0") }
@@ -588,6 +655,14 @@ fun MeasurementSettingScreen(navController: NavController) {
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
+            OutlinedTextField(
+                value = cvCycle,
+                onValueChange = { cvCycle = it },
+                label = { Text("Cycle Count") }, // Cycle 설정 추가
+                placeholder = { Text("e.g., 1") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
 
             Spacer(modifier = Modifier.height(16.dp))
 
@@ -622,7 +697,7 @@ fun MeasurementSettingScreen(navController: NavController) {
                         onClick = { expanded = !expanded },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text(text = caTimeUnit) // 현재 선택된 Time Unit 표시
+                        Text(text = caTimeUnit)
                     }
                     DropdownMenu(
                         expanded = expanded,
@@ -633,14 +708,14 @@ fun MeasurementSettingScreen(navController: NavController) {
                                 caTimeUnit = "sec"
                                 expanded = false
                             },
-                            text = { Text("sec") } // 명시적으로 'text' 파라미터에 Text 컴포저블 전달
+                            text = { Text("sec") }
                         )
                         DropdownMenuItem(
                             onClick = {
                                 caTimeUnit = "min"
                                 expanded = false
                             },
-                            text = { Text("min") } // 명시적으로 'text' 파라미터에 Text 컴포저블 전달
+                            text = { Text("min") }
                         )
                     }
                 }
@@ -656,12 +731,15 @@ fun MeasurementSettingScreen(navController: NavController) {
                         val minVoltage = cvMinVoltage.toFloat()
                         val maxVoltage = cvMaxVoltage.toFloat()
                         val rate = scanRate.toInt()
+                        val cycle = cvCycle.toInt() // Cycle 검증
                         val timeValue = caTimeValue.toInt()
 
                         if (minVoltage < -1.0 || maxVoltage > 1.0 || minVoltage >= maxVoltage) {
                             Toast.makeText(context, "Voltage range must be within ±1V.", Toast.LENGTH_SHORT).show()
                         } else if (rate < 5 || rate > 200) {
                             Toast.makeText(context, "Scan rate must be between 5 and 200 mV/s.", Toast.LENGTH_SHORT).show()
+                        } else if (cycle < 1 || cycle > 100) {
+                            Toast.makeText(context, "Cycle must be between 1 and 100.", Toast.LENGTH_SHORT).show()
                         } else if (timeValue < 1 || timeValue > 60) {
                             Toast.makeText(context, "Time value must be between 1 and 60.", Toast.LENGTH_SHORT).show()
                         } else {
@@ -670,6 +748,7 @@ fun MeasurementSettingScreen(navController: NavController) {
                                 putString("cvMinVoltage", cvMinVoltage)
                                 putString("cvMaxVoltage", cvMaxVoltage)
                                 putString("scanRate", scanRate)
+                                putString("cvCycle", cvCycle) // Cycle 저장
                                 putString("caVoltage", caVoltage)
                                 putString("caTimeValue", caTimeValue)
                                 putString("caTimeUnit", caTimeUnit)
@@ -689,8 +768,6 @@ fun MeasurementSettingScreen(navController: NavController) {
         }
     }
 }
-
-
 
 @ExperimentalMaterial3Api
 @Composable
